@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
 FILES=['.env.example','.gitignore','.dockerignore','Dockerfile','compose.yaml','package.json','package-lock.json',
-       'tsconfig.json','vite.config.ts','index.html','playwright.config.ts','README.md','PLAN.md','TEST_REPORT.md','start-local.ps1']
+       'tsconfig.json','vite.config.ts','index.html','playwright.config.ts','README.md','PLAN.md','TEST_REPORT.md','start-local.ps1','LICENSE','.gitattributes']
 FOLDERS=['backend','src','data','scripts','tests','deploy','dist']
 
 def package():
