@@ -1,0 +1,11 @@
+node_modules
+.venv
+.runtime
+.env
+artifacts
+tests
+__pycache__
+.pytest_cache
+dist
+.git
+*.tsbuildinfo

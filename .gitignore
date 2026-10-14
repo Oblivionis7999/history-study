@@ -1,0 +1,46 @@
+# Dependencies, generated files and local study data
+node_modules/
+dist/
+.venv/
+.runtime/
+artifacts/
+__pycache__/
+.pytest_cache/
+test-results/
+playwright-report/
+blob-report/
+*.pyc
+*.tsbuildinfo
+
+# Credentials: only the empty example belongs in Git
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# Databases, logs, exports and original document metadata
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
+*.log.*
+history-study-backup*.json
+*.docx
+*.doc
+*.pdf
+*.zip
+*.7z
+*.rar
+
+# Machine and editor state
+.codex/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

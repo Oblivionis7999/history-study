@@ -1,0 +1,54 @@
+{
+  "total": 700,
+  "counts": {
+    "single": 300,
+    "multiple": 300,
+    "judge": 100
+  },
+  "format_repairs": [
+    {
+      "id": "single-198",
+      "issue": "补齐选项标记分隔符",
+      "source": "D中共七大"
+    },
+    {
+      "id": "single-203",
+      "issue": "拆分同段多个选项",
+      "source": "A．①②③④B．②①④③C．③④②①D．②④①③"
+    },
+    {
+      "id": "single-217",
+      "issue": "全角答案字母规范化"
+    },
+    {
+      "id": "single-218",
+      "issue": "全角答案字母规范化"
+    },
+    {
+      "id": "single-219",
+      "issue": "全角答案字母规范化"
+    },
+    {
+      "id": "single-254",
+      "issue": "原编号与顺序不一致，使用独立ID",
+      "source_number": 154
+    },
+    {
+      "id": "multiple-127",
+      "issue": "补齐选项标记分隔符",
+      "source": "A实行工农兵代表大会制度"
+    },
+    {
+      "id": "multiple-183",
+      "issue": "拆分同段多个选项",
+      "source": "A.东北野战军         B.华北野战军"
+    },
+    {
+      "id": "multiple-183",
+      "issue": "拆分同段多个选项",
+      "source": "C.中原野战军         D.华东野战军"
+    }
+  ],
+  "source_sha256": "f9fb0394a77df1f27e8cb193ecb4338ff7518b7a61894a48673557ecd2830993",
+  "classification": "网站历史主题分类，已按题目顺序及题意整理"
+}
