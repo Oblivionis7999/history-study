@@ -1,371 +1,271 @@
 import asyncio
-import base64
-import hashlib
-import hmac
-import json
+import ipaddress
 import logging
 import os
-import random
-import re
 import secrets
 import time
-from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
-from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
-
-import httpx
-from argon2 import PasswordHasher
-from argon2.exceptions import VerificationError, InvalidHashError
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from .storage import Store
-from .backup import validate_records
-from .bank import ROOT, BANK, QUESTIONS, THEME_ORDER, TITLES, DEFAULT_PREFS
+from starlette.middleware.gzip import GZipMiddleware
+from .accounts import Accounts, digest, password_hash, public_user, verify
+from .bank import ROOT, BANK, QUESTIONS
 
-load_dotenv(ROOT/'.env')
+load_dotenv(ROOT / '.env')
 
 @dataclass
 class Config:
-    dev: bool = os.getenv('DEV_MODE','0')=='1'
-    password_hash: str = os.getenv('ACCESS_PASSWORD_HASH','')
-    secret: str = os.getenv('SESSION_SECRET','')
-    ai_base: str = os.getenv('AI_BASE_URL','').rstrip('/')
-    ai_key: str = os.getenv('AI_API_KEY','')
-    ai_model: str = os.getenv('AI_MODEL','')
-    ai_stream: bool = os.getenv('AI_STREAM','1')=='1'
+    dev: bool = os.getenv('DEV_MODE', '0') == '1'
+    public_origin: str = os.getenv('PUBLIC_ORIGIN', '').rstrip('/')
+    trusted_proxies: str = os.getenv('TRUSTED_PROXY_CIDRS', '')
+    session_hours: int = int(os.getenv('SESSION_HOURS', '12'))
+    ai_base: str = os.getenv('AI_BASE_URL', '').rstrip('/')
+    ai_key: str = os.getenv('AI_API_KEY', '')
+    ai_model: str = os.getenv('AI_MODEL', '')
+    ai_stream: bool = os.getenv('AI_STREAM', '1') == '1'
+    ai_minute: int = int(os.getenv('AI_USER_PER_MINUTE', '6'))
+    ai_daily: int = int(os.getenv('AI_USER_DAILY', '80'))
+    ai_global_daily: int = int(os.getenv('AI_GLOBAL_DAILY', '500'))
+    ai_concurrency: int = int(os.getenv('AI_CONCURRENCY', '3'))
+    ai_max_tokens: int = int(os.getenv('AI_MAX_TOKENS', '1800'))
 
 class Login(BaseModel):
-    password: str = Field(max_length=256)
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=1, max_length=128)
 
-class NewSession(BaseModel):
-    mode: str
-    feedback: str = 'immediate'
-    theme: str | None = None
-    type: str | None = None
-    random_order: bool = False
-    shuffle_options: bool = False
-    reduce_repeats: bool = False
-    review_filter: str = 'all'
+class Registration(Login):
+    display_name: str = Field(min_length=1, max_length=40)
+    invite: str = Field(default='', max_length=128)
 
-class Progress(BaseModel):
-    revision: int
-    cursor: int | None = None
-    question_id: str | None = None
-    selected: list[str] | None = None
+class PasswordChange(BaseModel):
+    current_password: str = Field(max_length=128)
+    new_password: str = Field(min_length=12, max_length=128)
 
-class Answer(BaseModel):
-    revision: int
-    question_id: str
-    selected: list[str]
+class Invite(BaseModel):
+    days: int = Field(default=7, ge=1, le=90)
+    max_uses: int = Field(default=1, ge=1, le=100)
 
-class Finish(BaseModel):
-    revision: int
+class AccountUpdate(BaseModel):
+    disabled: bool | None = None
+    new_password: str | None = Field(default=None, min_length=12, max_length=128)
 
-class StateChange(BaseModel):
-    revision: int
-    favorite: bool | None = None
-    uncertain: bool | None = None
-    mastered: bool | None = None
-    disputed: bool | None = None
-    note: str | None = Field(default=None,max_length=12000)
+class Settings(BaseModel):
+    open_registration: bool
+    ai_enabled: bool
+    ai_daily: int = Field(ge=0, le=10000)
+    ai_global_daily: int = Field(ge=0, le=100000)
 
-class Chat(BaseModel):
-    question_id: str
-    session_id: str
-    action: str = 'explain'
-    message: str = Field(default='',max_length=5000)
-
-def empty_state(qid):
-    return {'id':qid,'favorite':False,'uncertain':False,'wrong':False,'mastered':False,'disputed':False,'note':'','revision':0}
-
-def session_or_404(c,sid):
-    s=Store.get(c,'session',sid)
-    if not s: raise HTTPException(404,'练习不存在。')
-    return s
-
-def check_revision(data,rev):
-    if data['revision']!=rev:
-        raise HTTPException(409,'这份记录已在另一处更新，请重新加载最新记录。')
-
-def validate_selected(qid,selected):
-    if qid not in QUESTIONS or len(set(selected))!=len(selected): raise HTTPException(400,'选项无效。')
-    q=QUESTIONS[qid]
-    if not set(selected)<=set(o['id'] for o in q['options']): raise HTTPException(400,'选项无效。')
-    if q['type']!='multiple' and len(selected)>1: raise HTTPException(400,'此题只能选择一个选项。')
-
-def grade(qid,selected):
-    q=QUESTIONS[qid]
-    return {'selected':selected,'correct_ids':q['answer_ids'],'correct':set(selected)==set(q['answer_ids']),'answered_at':time.time()}
-
-def record_result(c,qid,result):
-    state=Store.get(c,'state',qid) or empty_state(qid)
-    if 'first_correct' not in state:
-        state['first_correct']=result['correct']
-    state['last_answered']=time.time()
-    if not result['correct']:
-        state['wrong']=True; state['mastered']=False
-    Store.put(c,'state',qid,state)
-
-def summary(s):
-    done=len(s['results']) if s['feedback']=='immediate' or s['status']=='completed' else sum(bool(v) for v in s['drafts'].values())
-    return {k:s[k] for k in ['id','mode','title','feedback','status','cursor','created_at','updated_at']} | {'total':len(s['question_ids']),'answered':done,'correct':sum(r['correct'] for r in s['results'].values()),'revision':s['revision']}
-
-def public_session(s):
-    questions=[]
-    for qid in s['question_ids']:
-        q=QUESTIONS[qid]
-        options={o['id']:o for o in q['options']}
-        questions.append({k:q[k] for k in ['id','type','stem','theme','shuffle_safe','source_number']} | {'options':[options[id] for id in s['option_orders'][qid]]})
-    return s | {'questions':questions}
-
-def ai_ready(cfg):
-    return bool(cfg.ai_base and cfg.ai_key and cfg.ai_model)
-
-def create_app(db_path=None,config=None):
-    cfg=config or Config()
-    db=Store(db_path or os.getenv('DATABASE_PATH',str(ROOT/'.runtime/history.sqlite')))
-    login_attempts={}; ai_active=set()
+def create_app(db_path=None, config=None):
+    cfg = config or Config()
+    db = Accounts(db_path or os.getenv('AUTH_DATABASE_PATH', str(ROOT / '.runtime/accounts.sqlite')))
+    proxies = [ipaddress.ip_network(v.strip()) for v in cfg.trusted_proxies.split(',') if v.strip()]
 
     async def backup_loop():
-        last=None
+        last = None
         while True:
-            now=datetime.now(ZoneInfo('Asia/Shanghai'))
-            if now.hour>=3 and last!=now.date():
+            now = datetime.now(ZoneInfo('Asia/Shanghai'))
+            if now.hour >= 3 and last != now.date():
                 try:
-                    await asyncio.to_thread(db.backup); last=now.date()
+                    await asyncio.to_thread(db.backup); last = now.date()
                 except Exception:
-                    logging.exception('Automatic database backup failed')
+                    logging.error('Account backup failed; check storage permissions and capacity.')
             await asyncio.sleep(60)
 
     @asynccontextmanager
     async def lifespan(app):
-        task=asyncio.create_task(backup_loop())
+        task = asyncio.create_task(backup_loop())
         yield
         task.cancel()
         try: await task
         except asyncio.CancelledError: pass
 
-    app=FastAPI(title='史纲 Study',lifespan=lifespan)
-    app.add_middleware(GZipMiddleware,minimum_size=1024,compresslevel=5)
-    app.state.db=db; app.state.config=cfg
+    app = FastAPI(title='史纲 Study V2', lifespan=lifespan, docs_url=None, redoc_url=None)
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+    app.state.db = db
+    app.state.config = cfg
+    app.state.ai_active = set()
 
-    def authorized(request):
-        if cfg.dev:
-            return request.client and request.client.host in {'127.0.0.1','::1','testclient'}
-        token=request.cookies.get('history_session','')
+    def client_ip(request):
+        remote = request.client.host if request.client else 'unknown'
         try:
-            encoded,signature=token.split('.')
-            expected=hmac.new(cfg.secret.encode(),encoded.encode(),hashlib.sha256).hexdigest()
-            if not cfg.secret or not hmac.compare_digest(signature,expected): return False
-            return time.time()<int(base64.urlsafe_b64decode(encoded+'='*((-len(encoded))%4)))
-        except (ValueError,TypeError): return False
+            if any(ipaddress.ip_address(remote) in net for net in proxies):
+                for entry in reversed(request.headers.get('x-forwarded-for', '').split(',')):
+                    candidate = ipaddress.ip_address(entry.strip())
+                    if not any(candidate in net for net in proxies): return str(candidate)
+        except ValueError: pass
+        return remote
+
+    def throttle(request, username=''):
+        minute = 'm:' + str(int(time.time() / 60))
+        ip = client_ip(request)
+        db.consume([('auth:' + digest(ip + ':' + username.lower()), minute, 10), ('auth-ip:' + digest(ip), minute, 120)])
 
     @app.middleware('http')
-    async def gate(request,call_next):
-        public=request.url.path in {'/api/health','/api/auth/login','/api/auth/me'}
-        if request.url.path.startswith('/api') and not public and not authorized(request):
-            return JSONResponse({'detail':'请先输入访问密码。'},status_code=401)
-        origin=request.headers.get('origin')
-        if request.method not in {'GET','HEAD','OPTIONS'} and origin and urlparse(origin).netloc!=request.headers.get('host'):
-            return JSONResponse({'detail':'请求来源不匹配。'},status_code=403)
-        response=await call_next(request)
-        response.headers['Cache-Control']='no-store'
-        response.headers['X-Content-Type-Options']='nosniff'
+    async def gate(request, call_next):
+        path = request.url.path
+        if request.headers.get('content-length', '').isdigit() and int(request.headers['content-length']) > 256 * 1024:
+            return JSONResponse({'detail': '请求过大。'}, status_code=413)
+        public = path in {'/api/health', '/api/auth/me', '/api/auth/login', '/api/auth/register'}
+        user = await asyncio.to_thread(db.session, request.cookies.get('history_session'))
+        request.state.user = user
+        if request.headers.get('x-study-user') and (not user or user['id'] != request.headers['x-study-user']):
+            return JSONResponse({'detail': '账号已切换，请重新登录。'}, status_code=401)
+        if path.startswith('/api') and not public and not user:
+            return JSONResponse({'detail': '登录已过期或账号已停用，请重新登录。'}, status_code=401)
+        if request.method not in {'GET', 'HEAD', 'OPTIONS'}:
+            origin = request.headers.get('origin')
+            expected = cfg.public_origin or ('http' if cfg.dev else 'https') + '://' + request.headers.get('host', '')
+            if request.headers.get('x-study-request') != '1' or (origin and origin != expected):
+                return JSONResponse({'detail': '请求来源校验失败。'}, status_code=403)
+        try: response = await call_next(request)
+        except Exception:
+            logging.error('Unhandled request failure (request body is never logged).')
+            return JSONResponse({'detail': '服务暂时不可用，请稍后重试。'}, status_code=500)
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['X-Content-Type-Options'] = 'nosniff'
         return response
 
+    def admin(request):
+        if not request.state.user or request.state.user['role'] != 'admin': raise HTTPException(403, '需要管理员权限。')
+        return request.state.user
+
+    def cookie(response, uid):
+        lifetime = max(1, min(cfg.session_hours, 168)) * 3600
+        token = db.new_session(uid, lifetime)
+        response.set_cookie('history_session', token, httponly=True, secure=not cfg.dev, samesite='strict', max_age=lifetime, path='/')
+
     @app.get('/api/health')
-    def health(): return {'ok':True,'bank_count':len(QUESTIONS),'version':BANK['version']}
+    def health():
+        return {'ok': True, 'bank_count': len(QUESTIONS), 'version': BANK['version'], 'app_version': '2.0.0'}
 
     @app.get('/api/auth/me')
-    def me(request:Request): return {'authenticated':bool(authorized(request)),'development':cfg.dev}
+    def me(request: Request):
+        with db.connect() as c: setting = c.execute("SELECT value FROM settings WHERE key='open_registration'").fetchone()
+        return {'user': request.state.user, 'development': cfg.dev, 'open_registration': bool(setting and setting['value'])}
 
     @app.post('/api/auth/login')
-    def login(body:Login,request:Request,response:Response):
-        ip=request.client.host if request.client else 'unknown'
-        attempts=[t for t in login_attempts.get(ip,[]) if t>time.time()-60]
-        if len(attempts)>=5: raise HTTPException(429,'尝试次数过多，请一分钟后重试。')
-        if len(cfg.secret)<32 or not cfg.password_hash: raise HTTPException(503,'请先在服务器配置访问密码和会话密钥。')
-        try: valid=PasswordHasher().verify(cfg.password_hash,body.password)
-        except (VerificationError,InvalidHashError): valid=False
-        if not valid:
-            login_attempts[ip]=attempts+[time.time()]
-            raise HTTPException(401,'访问密码不正确。')
-        encoded=base64.urlsafe_b64encode(str(int(time.time()+30*86400)).encode()).decode().rstrip('=')
-        sig=hmac.new(cfg.secret.encode(),encoded.encode(),hashlib.sha256).hexdigest()
-        response.set_cookie('history_session',f'{encoded}.{sig}',httponly=True,secure=not cfg.dev,samesite='strict',max_age=30*86400,path='/')
-        return {'ok':True}
+    def login(body: Login, request: Request, response: Response):
+        throttle(request, body.username)
+        with db.connect() as c: row = c.execute('SELECT * FROM users WHERE username=?', (body.username.strip().lower(),)).fetchone()
+        valid = verify(row['password_hash'] if row else None, body.password)
+        if not row or not valid or row['disabled']: raise HTTPException(401, '用户名或密码不正确，或账号已停用。')
+        db.revoke(token=request.cookies.get('history_session'))
+        cookie(response, row['id'])
+        return {'user': public_user(row)}
+
+    @app.post('/api/auth/register')
+    def register(body: Registration, request: Request):
+        throttle(request, body.username)
+        return {'user': db.create_user(body.username, body.display_name, body.password, invite=body.invite)}
 
     @app.post('/api/auth/logout')
-    def logout(response:Response):
-        response.delete_cookie('history_session'); return {'ok':True}
+    def logout(request: Request, response: Response):
+        db.revoke(token=request.cookies.get('history_session'))
+        response.delete_cookie('history_session', path='/')
+        return {'ok': True}
 
-    @app.get('/api/dashboard')
-    def dashboard():
-        with db.transaction() as c:
-            states={s['id']:s for s in Store.all(c,'state')}
-            sessions=Store.all(c,'session')
-            prefs=Store.get(c,'prefs','main') or DEFAULT_PREFS
-        answered=[s for s in states.values() if 'first_correct' in s]
-        due=[s for s in states.values() if s['wrong'] or s['uncertain']]
-        themes=[]
-        for t in BANK['themes']:
-            ids=[q['id'] for q in QUESTIONS.values() if q['theme']==t['id']]
-            themes.append(t|{'total':len(ids),'done':sum('first_correct' in states.get(id,{}) for id in ids),'due':sum(states.get(id,{}).get('wrong',False) or states.get(id,{}).get('uncertain',False) for id in ids)})
-        return {'title':BANK['title'],'version':BANK['version'],'total':len(QUESTIONS),'counts':dict(Counter(q['type'] for q in QUESTIONS.values())),
-                'stats':{'answered':len(answered),'first_correct':sum(s['first_correct'] for s in answered),'due':len(due),'wrong':sum(s['wrong'] for s in states.values()),'uncertain':sum(s['uncertain'] for s in states.values()),'favorites':sum(s['favorite'] for s in states.values()),'mastered':sum(s['mastered'] for s in states.values())},
-                'themes':themes,'states':states,'sessions':[summary(s) for s in sessions[:30]],'prefs':prefs,
-                'ai':{'configured':ai_ready(cfg),'model':cfg.ai_model if ai_ready(cfg) else ''}}
+    @app.post('/api/auth/revoke-all')
+    def revoke_all(request: Request, response: Response):
+        db.revoke(uid=request.state.user['id'])
+        response.delete_cookie('history_session', path='/')
+        return {'ok': True}
 
-    @app.put('/api/preferences')
-    def preferences(body:dict):
-        with db.transaction() as c:
-            prefs=(Store.get(c,'prefs','main') or DEFAULT_PREFS.copy()).copy()
-            for key in DEFAULT_PREFS:
-                if key in body:
-                    if not isinstance(body[key],bool): raise HTTPException(400,'设置必须为开关。')
-                    prefs[key]=body[key]
-            return Store.put(c,'prefs','main',prefs)
+    @app.post('/api/auth/password')
+    def change_password(body: PasswordChange, request: Request, response: Response):
+        uid = request.state.user['id']
+        throttle(request, uid)
+        encoded = password_hash(body.new_password)
+        with db.connect() as c:
+            row = c.execute('SELECT password_hash FROM users WHERE id=?', (uid,)).fetchone()
+            if not verify(row['password_hash'], body.current_password): raise HTTPException(400, '当前密码不正确。')
+            c.execute('UPDATE users SET password_hash=? WHERE id=?', (encoded, uid))
+            c.execute('DELETE FROM sessions WHERE user_id=?', (uid,))
+        response.delete_cookie('history_session', path='/')
+        return {'ok': True}
 
-    @app.post('/api/sessions')
-    def new_session(body:NewSession):
-        if body.mode not in TITLES or body.feedback not in {'immediate','test'}: raise HTTPException(400,'练习模式无效。')
-        if body.feedback=='test' and body.mode not in {'paper80','paper20'}: raise HTTPException(400,'此模式不支持整卷自测。')
-        with db.transaction() as c:
-            states={s['id']:s for s in Store.all(c,'state')}
-            pool=list(QUESTIONS.values())
-            if body.mode=='category':
-                if body.theme: pool=[q for q in pool if q['theme']==body.theme]
-                if body.type: pool=[q for q in pool if q['type']==body.type]
-            if body.mode=='review':
-                if body.review_filter not in {'all','wrong','uncertain'}: raise HTTPException(400,'复习筛选无效。')
-                pool=[q for q in pool if (states.get(q['id'],{}).get('wrong',False) if body.review_filter=='wrong' else states.get(q['id'],{}).get('uncertain',False) if body.review_filter=='uncertain' else states.get(q['id'],{}).get('wrong',False) or states.get(q['id'],{}).get('uncertain',False))]
-            if body.mode=='favorites': pool=[q for q in pool if states.get(q['id'],{}).get('favorite',False)]
-            if not pool: raise HTTPException(400,'这里暂时没有题目，先去练习或收藏几道题。')
-            if body.mode in {'paper80','paper20'}:
-                quota={'single':35,'multiple':35,'judge':10} if body.mode=='paper80' else {'single':9,'multiple':9,'judge':2}
-                selected=[]
-                for kind,n in quota.items():
-                    group=[q for q in pool if q['type']==kind]
-                    random.shuffle(group)
-                    if body.reduce_repeats:
-                        group.sort(key=lambda q:int((states.get(q['id'],{}).get('last_answered',0)+8*3600)//86400))
-                    selected.extend(group[:n])
-                pool=selected; random.shuffle(pool)
-            elif body.random_order: random.shuffle(pool)
-            else: pool.sort(key=lambda q:(THEME_ORDER[q['theme']],q['order'],q['type']))
-            orders={}
-            for q in pool:
-                ids=[o['id'] for o in q['options']]
-                if body.shuffle_options and q['shuffle_safe'] and q['type']!='judge': random.shuffle(ids)
-                orders[q['id']]=ids
-            title=TITLES[body.mode]
-            if body.mode=='category' and body.theme:
-                title=next((t['name'] for t in BANK['themes'] if t['id']==body.theme),title)
-            sid=secrets.token_hex(12)
-            s={'id':sid,'mode':body.mode,'title':title,'feedback':body.feedback,'status':'active','question_ids':[q['id'] for q in pool],
-               'option_orders':orders,'cursor':0,'drafts':{},'results':{},'created_at':time.time(),'bank_version':BANK['version']}
-            Store.put(c,'session',sid,s)
-        return public_session(s)
+    @app.patch('/api/auth/profile')
+    def profile(body: dict, request: Request):
+        name = body.get('display_name')
+        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 40: raise HTTPException(400, '显示名称需要 1–40 个字符。')
+        with db.connect() as c: c.execute('UPDATE users SET display_name=? WHERE id=?', (name.strip(), request.state.user['id']))
+        return {'ok': True}
 
-    @app.get('/api/sessions/{sid}')
-    def get_session(sid:str):
-        with db.transaction() as c: return public_session(session_or_404(c,sid))
+    @app.get('/api/bank')
+    def bank():
+        # Local grading delivers answers. Self-test is a learning UX, not anti-cheat.
+        return {k: BANK[k] for k in ('title', 'version', 'themes')} | {'questions': [{k: q[k] for k in ('id', 'type', 'stem', 'theme', 'shuffle_safe', 'source_number', 'options', 'answer_ids')} for q in QUESTIONS.values()]}
 
-    @app.patch('/api/sessions/{sid}/progress')
-    def progress(sid:str,body:Progress):
-        with db.transaction() as c:
-            s=session_or_404(c,sid); check_revision(s,body.revision)
-            if body.cursor is not None:
-                if not 0<=body.cursor<len(s['question_ids']): raise HTTPException(400,'题号超出范围。')
-                s['cursor']=body.cursor
-            if body.question_id is not None:
-                if body.question_id not in s['question_ids']: raise HTTPException(400,'题目不在当前练习中。')
-                validate_selected(body.question_id,body.selected or [])
-                if body.question_id not in s['results'] and s['status']=='active': s['drafts'][body.question_id]=body.selected or []
-            Store.put(c,'session',sid,s)
-            return public_session(s)
+    @app.get('/api/config')
+    def configuration(request: Request):
+        with db.connect() as c:
+            settings = dict(c.execute('SELECT key,value FROM settings').fetchall())
+            used = c.execute('SELECT count FROM limits WHERE key=? AND bucket=?', ('ai-user:' + request.state.user['id'], 'd:' + str(int(time.time()/86400)))).fetchone()
+        return {'configured': bool(cfg.ai_base and cfg.ai_key and cfg.ai_model and settings.get('ai_enabled', 1)), 'model': cfg.ai_model,
+                'cache_scope': digest(cfg.ai_base + ':' + cfg.ai_model + ':v2'), 'daily_limit': settings.get('ai_daily', cfg.ai_daily), 'used_today': used['count'] if used else 0}
 
-    @app.post('/api/sessions/{sid}/answers')
-    def answer(sid:str,body:Answer):
-        with db.transaction() as c:
-            s=session_or_404(c,sid)
-            if body.question_id not in s['question_ids']: raise HTTPException(400,'题目不在当前练习中。')
-            if body.question_id in s['results']: return public_session(s)
-            if s['status']!='active': raise HTTPException(400,'练习已经结束。')
-            check_revision(s,body.revision); validate_selected(body.question_id,body.selected)
-            if not body.selected: raise HTTPException(400,'请先选择答案。')
-            s['drafts'][body.question_id]=body.selected
-            if s['feedback']=='immediate':
-                result=grade(body.question_id,body.selected)
-                s['results'][body.question_id]=result
-                record_result(c,body.question_id,result)
-                if len(s['results'])==len(s['question_ids']): s['status']='completed'
-            Store.put(c,'session',sid,s)
-            return public_session(s)
+    @app.get('/api/admin')
+    def overview(request: Request):
+        admin(request)
+        with db.connect() as c:
+            return {'users': [public_user(row) for row in c.execute('SELECT * FROM users ORDER BY created_at')],
+                    'invites': [dict(row) for row in c.execute('SELECT id,expires_at,max_uses,uses,disabled FROM invites')],
+                    'settings': {'open_registration': 0, 'ai_enabled': 1, 'ai_daily': cfg.ai_daily, 'ai_global_daily': cfg.ai_global_daily} | dict(c.execute('SELECT key,value FROM settings').fetchall()),
+                    'active_sessions': c.execute('SELECT count(*) FROM sessions WHERE expires_at>?', (time.time(),)).fetchone()[0],
+                    'bank_count': len(QUESTIONS), 'ai_configured': bool(cfg.ai_base and cfg.ai_key and cfg.ai_model)}
 
-    @app.post('/api/sessions/{sid}/finish')
-    def finish(sid:str,body:Finish):
-        with db.transaction() as c:
-            s=session_or_404(c,sid)
-            if s['status']=='completed': return public_session(s)
-            check_revision(s,body.revision)
-            if s['feedback']=='test':
-                for qid,selected in s['drafts'].items():
-                    if selected:
-                        result=grade(qid,selected); s['results'][qid]=result; record_result(c,qid,result)
-                s['status']='completed'
-            elif len(s['results'])!=len(s['question_ids']):
-                raise HTTPException(400,'请先完成剩余题目；你可以直接退出，下次继续。')
-            Store.put(c,'session',sid,s)
-            return public_session(s)
+    @app.post('/api/admin/users')
+    def create_user(body: Registration, request: Request):
+        admin(request)
+        return db.create_user(body.username, body.display_name, body.password, admin=True)
 
-    @app.patch('/api/questions/{qid}/state')
-    def change_state(qid:str,body:StateChange):
-        if qid not in QUESTIONS: raise HTTPException(404,'题目不存在。')
-        with db.transaction() as c:
-            state=Store.get(c,'state',qid) or empty_state(qid)
-            check_revision(state,body.revision)
-            for k,v in body.model_dump(exclude={'revision'},exclude_none=True).items(): state[k]=v
-            if body.mastered is True: state['wrong']=False; state['uncertain']=False
-            if body.uncertain is True: state['mastered']=False
-            return Store.put(c,'state',qid,state)
+    @app.patch('/api/admin/users/{uid}')
+    def update_user(uid: str, body: AccountUpdate, request: Request):
+        current = admin(request)
+        if uid == current['id']: raise HTTPException(400, '不能停用或重置当前管理员；修改自己的密码请使用账号设置。')
+        encoded = password_hash(body.new_password) if body.new_password else None
+        with db.connect() as c:
+            row = c.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()
+            if not row: raise HTTPException(404, '账号不存在。')
+            if row['role'] == 'admin' and body.disabled and c.execute("SELECT count(*) FROM users WHERE role='admin' AND disabled=0").fetchone()[0] <= 1:
+                raise HTTPException(400, '必须保留一个有效管理员。')
+            if body.disabled is not None: c.execute('UPDATE users SET disabled=? WHERE id=?', (int(body.disabled), uid))
+            if encoded: c.execute('UPDATE users SET password_hash=? WHERE id=?', (encoded, uid))
+            c.execute('DELETE FROM sessions WHERE user_id=?', (uid,))
+        return {'ok': True}
 
-    @app.get('/api/export')
-    def export():
-        with db.transaction() as c:
-            payload={'format':'history-study-v1','bank_version':BANK['version'],'exported_at':time.time(),
-                     'records':{k:Store.all(c,k) for k in ['session','state','chat','cache','prefs']}}
-        return Response(json.dumps(payload,ensure_ascii=False),media_type='application/json',headers={'Content-Disposition':'attachment; filename="history-study-backup.json"'})
+    @app.post('/api/admin/users/{uid}/revoke')
+    def revoke_user(uid: str, request: Request):
+        admin(request); db.revoke(uid=uid)
+        return {'ok': True}
 
-    @app.post('/api/restore')
-    async def restore(request:Request):
-        raw=await request.body()
-        if len(raw)>20*1024*1024: raise HTTPException(413,'备份文件不能超过20MB。')
-        try: payload=json.loads(raw)
-        except (ValueError,UnicodeDecodeError): raise HTTPException(400,'备份不是有效JSON。')
-        if not isinstance(payload,dict) or payload.get('format')!='history-study-v1' or payload.get('bank_version')!=BANK['version']:
-            raise HTTPException(400,'备份格式或题库版本不匹配。')
-        records=payload.get('records',{})
-        try:
-            validate_records(records,QUESTIONS,BANK['version'],TITLES,DEFAULT_PREFS)
-        except (ValueError,KeyError,TypeError): raise HTTPException(400,'备份记录校验失败，原数据未修改。')
-        await asyncio.to_thread(db.backup)
-        with db.transaction() as c:
-            for kind,items in records.items():
-                c.execute('DELETE FROM records WHERE kind=?',(kind,))
-                for item in items: Store.put(c,kind,item['id'],item)
-        return {'ok':True}
+    @app.post('/api/admin/invites')
+    def invite(body: Invite, request: Request):
+        admin(request)
+        code, iid = secrets.token_urlsafe(24), secrets.token_hex(16)
+        expires = time.time() + body.days * 86400
+        with db.connect() as c: c.execute('INSERT INTO invites VALUES(?,?,?,?,0,0)', (iid, digest(code), expires, body.max_uses))
+        return {'id': iid, 'code': code, 'expires_at': expires}
 
-    # AI routes are registered separately so their error/cancellation paths can be tested.
+    @app.delete('/api/admin/invites/{iid}')
+    def disable_invite(iid: str, request: Request):
+        admin(request)
+        with db.connect() as c: c.execute('UPDATE invites SET disabled=1 WHERE id=?', (iid,))
+        return {'ok': True}
+
+    @app.put('/api/admin/settings')
+    def settings(body: Settings, request: Request):
+        admin(request)
+        with db.connect() as c:
+            for key, value in body.model_dump().items(): c.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, int(value)))
+        return {'ok': True}
+
     from .ai import register_ai
-    register_ai(app,db,cfg,QUESTIONS,Chat,session_or_404,ai_active)
+    register_ai(app, db, cfg, QUESTIONS)
     return app
 
-app=create_app()
+app = create_app()

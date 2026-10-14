@@ -7,9 +7,9 @@ services:
     env_file: .env
     environment:
       DEV_MODE: "0"
-      DATABASE_PATH: /app/.runtime/history.sqlite
+      AUTH_DATABASE_PATH: /app/.runtime/accounts.sqlite
     volumes:
-      - study-data:/app/.runtime
+      - account-data:/app/.runtime
     restart: unless-stopped
     mem_limit: 768m
     healthcheck:
@@ -40,4 +40,4 @@ services:
         max-size: "10m"
         max-file: "3"
 volumes:
-  study-data:
+  account-data:

@@ -1,21 +1,24 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
-import { ArrowRight, ArrowLeft, BookOpen, Bookmark, Check, ChevronRight, CircleHelp, Clock3, Download, Flag, Grid2X2, Layers3, ListChecks, LoaderCircle, Menu, PanelLeftClose, Plus, RotateCcw, Settings2, ShieldCheck, Sparkles, Upload, X } from 'lucide-react';
-import { api, ApiError, initialState, labels, modeNames } from './api';
-import type { Dashboard, Feedback, Kind, Mode, Preferences, Question, QuestionState, Session } from './api';
+import { ArrowRight, ArrowLeft, BookOpen, Bookmark, Check, ChevronRight, CircleHelp, Clock3, Flag, Grid2X2, Layers3, ListChecks, LoaderCircle, Menu, PanelLeftClose, Plus, RotateCcw, Settings2, ShieldCheck, Sparkles, X } from 'lucide-react';
+import { api as learningApi, ApiError, initialState, labels, modeNames } from './api';
+import type { Dashboard, Feedback, Kind, Mode, Preferences, Question, QuestionState, Session, User } from './api';
 import AIPanel from './AIPanel';
+import AccountSettings from './AccountSettings';
+import ReviewExplorer from './ReviewExplorer';
+import { activeEpoch, assertActive, readData } from './vault';
+import { getDrafts, savePending, saveNoteDraft } from './learning';
 
 type Launch = { mode: Mode; theme?: string; name?: string };
 type Pending = { path: string; body: Record<string, unknown>; sid: string };
-const pendingKey = (sid: string, qid: string) => 'history-pending-' + sid + '-' + qid;
 const dateText = (stamp: number) => new Date(stamp * 1000).toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', timeZone: 'Asia/Shanghai' });
 
-export default function App() {
-  const [auth, setAuth] = useState<boolean | null>(null);
-  const [development, setDevelopment] = useState(false);
+export default function App({ user, onLogout, onLock }: { user: User; onLogout: () => Promise<void>; onLock: () => void }) {
+  const generation = useRef(activeEpoch());
+  const api = useCallback(async <T,>(path: string, method = 'GET', body?: unknown): Promise<T> => { assertActive(user.id, generation.current); const result = await learningApi<T>(path, method, body); assertActive(user.id, generation.current); return result; }, [user.id]);
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const sessionRef = useRef<Session | null>(null);
-  const [page, setPage] = useState<'home' | 'practice' | 'result' | 'settings'>('home');
+  const [page, setPage] = useState<'home' | 'practice' | 'result' | 'settings' | 'explore'>('home');
   const [leftOpen, setLeftOpen] = useState(() => window.innerWidth >= 1024 && localStorage.getItem('history-left') !== 'closed');
   const [aiOpen, setAiOpen] = useState(false);
   const [launch, setLaunch] = useState<Launch | null>(null);
@@ -26,11 +29,32 @@ export default function App() {
   const [milestone, setMilestone] = useState(false);
   const [finishConfirm, setFinishConfirm] = useState(false);
   const queue = useRef<Promise<unknown>>(Promise.resolve());
+  useEffect(() => {
+    const resized = () => { if (window.innerWidth < 1024) setLeftOpen(false); };
+    window.addEventListener('resize', resized); return () => window.removeEventListener('resize', resized);
+  }, []);
+  useEffect(() => {
+    if (window.innerWidth >= 1024 || (!leftOpen && !aiOpen)) return;
+    const panel = document.querySelector<HTMLElement>(aiOpen ? '.ai-sidebar' : '.left-sidebar');
+    if (!panel) return;
+    const previous = document.activeElement as HTMLElement | null, overflow = document.body.style.overflow;
+    panel.setAttribute('role', 'dialog'); panel.setAttribute('aria-modal', 'true'); panel.setAttribute('aria-label', aiOpen ? 'AI学习助手' : '学习导航');
+    document.body.style.overflow = 'hidden'; panel.querySelector<HTMLElement>('button, input, textarea')?.focus();
+    const key = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { setLeftOpen(false); setAiOpen(false); }
+      if (event.key !== 'Tab') return;
+      const items = [...panel.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select')];
+      if (event.shiftKey && document.activeElement === items[0]) { event.preventDefault(); items.at(-1)?.focus(); }
+      else if (!event.shiftKey && document.activeElement === items.at(-1)) { event.preventDefault(); items[0]?.focus(); }
+    };
+    window.addEventListener('keydown', key);
+    return () => { window.removeEventListener('keydown', key); document.body.style.overflow = overflow; panel.removeAttribute('role'); panel.removeAttribute('aria-modal'); previous?.focus(); };
+  }, [leftOpen, aiOpen]);
   useEffect(() => { setLaunchError(''); }, [launch]);
   const applySession = useCallback((s: Session) => { sessionRef.current = s; setSession(s); }, []);
   const refresh = useCallback(async () => { const d = await api<Dashboard>('/dashboard'); setDashboard(d); return d; }, []);
   const handleError = useCallback((e: unknown) => {
-    if (e instanceof ApiError && e.status === 401) setAuth(false);
+    if (e instanceof ApiError && e.status === 401) onLock();
     setNotice(e instanceof Error ? e.message : '连接失败，请检查网络后重试。');
   }, []);
   const loadSession = useCallback(async (id: string, review = false) => {
@@ -39,10 +63,6 @@ export default function App() {
   }, [applySession, handleError]);
 
   useEffect(() => {
-    api<{ authenticated: boolean; development: boolean }>('/auth/me').then(r => { setAuth(r.authenticated); setDevelopment(r.development); }).catch(handleError);
-  }, [handleError]);
-  useEffect(() => {
-    if (!auth) return;
     refresh().catch(handleError);
     const id = new URLSearchParams(location.search).get('session');
     if (id) void loadSession(id);
@@ -50,7 +70,7 @@ export default function App() {
     const onVisible = () => { if (!document.hidden) refresh().catch(handleError); };
     window.addEventListener('popstate', onPop); document.addEventListener('visibilitychange', onVisible);
     return () => { window.removeEventListener('popstate', onPop); document.removeEventListener('visibilitychange', onVisible); };
-  }, [auth, refresh, loadSession, handleError]);
+  }, [refresh, loadSession, handleError]);
 
   const home = () => { setPage('home'); setAiOpen(false); history.pushState({}, '', '/'); refresh().catch(handleError); if (window.innerWidth < 1024) setLeftOpen(false); };
   const resume = async (id: string, review = false) => { const s = await loadSession(id, review); if (s) history.pushState({}, '', '/?session=' + id); if (window.innerWidth < 1024) setLeftOpen(false); };
@@ -68,11 +88,11 @@ export default function App() {
       if (!current || current.id !== sid) throw new Error('当前练习已切换，请重新操作。');
       setBusy(true);
       const ticket: Pending = { path: suffix, body, sid };
-      const key = pendingKey(sid, String(body.question_id ?? 'cursor'));
-      localStorage.setItem(key, JSON.stringify(ticket));
+      assertActive(user.id, generation.current);
+      try { await savePending(sid, String(body.question_id ?? 'cursor'), ticket); } catch (e) { setBusy(false); setPending(ticket); handleError(e); throw e; }
       try {
         const s = await api<Session>('/sessions/' + sid + suffix, method, { ...body, revision: current.revision });
-        localStorage.removeItem(key); setPending(null); setNotice('');
+        setPending(null); setNotice('');
         if (sessionRef.current?.id === sid) applySession(s);
         return s;
       } catch (e) { setPending(ticket); handleError(e); throw e; }
@@ -121,8 +141,7 @@ export default function App() {
     } catch (e) { handleError(e); }
   };
 
-  if (auth === null || (auth && !dashboard)) return <div className="loading-screen"><BookOpen size={36} /><p>正在打开你的复习空间…</p>{notice && <button onClick={() => location.reload()}>重新连接</button>}</div>;
-  if (!auth) return <Login onLogin={() => { setAuth(true); setNotice(''); }} />;
+  if (!dashboard) return <div className="loading-screen"><BookOpen size={36} /><p>正在打开你的复习空间…</p>{notice && <button onClick={() => location.reload()}>重新连接</button>}</div>;
   if (!dashboard) return null;
   const d = dashboard;
   const latestFull = d.sessions.find(s => s.mode === 'full' && s.status === 'active');
@@ -130,20 +149,20 @@ export default function App() {
   const toggleLeft = () => { setLeftOpen(v => { localStorage.setItem('history-left', v ? 'closed' : 'open'); return !v; }); if (window.innerWidth < 1024) setAiOpen(false); };
 
   return <div className={'app' + (leftOpen ? ' left-open' : '') + (aiOpen && question ? ' ai-open' : '')}>
-    <div className="global-nav"><span>个人复习空间</span><span>中国近现代史纲要 · 2023版</span><span className="global-end"><ShieldCheck size={13} /> 私人学习记录</span></div>
+    <div className="global-nav"><span>{user.display_name} 的学习空间</span><span>中国近现代史纲要 · 2023版</span><span className="global-end"><ShieldCheck size={13} /> 本机加密记录</span></div>
     <header className="topbar">
       <div className="brand-group"><button className="icon-button" aria-label={leftOpen ? '收起导航' : '展开导航'} onClick={toggleLeft}>{leftOpen ? <PanelLeftClose size={20} /> : <Menu size={20} />}</button><button className="brand" onClick={home}><BookOpen size={24} /><span>史纲 <span className="brand-light">Study</span></span></button></div>
-      <nav className="top-links"><button className={page === 'home' ? 'active' : ''} onClick={home}>学习概览</button><button onClick={() => setLaunch({ mode: 'review' })}>我的复习</button><button className={page === 'settings' ? 'active' : ''} onClick={() => { setPage('settings'); setAiOpen(false); }}>设置与数据</button></nav>
+      <nav className="top-links"><button className={page === 'home' ? 'active' : ''} onClick={home}>学习概览</button><button onClick={() => { setPage('explore'); setAiOpen(false); }}>搜索与复习</button><button className={page === 'settings' ? 'active' : ''} onClick={() => { setPage('settings'); setAiOpen(false); }}>设置与数据</button></nav>
       <button className="primary compact top-continue" onClick={() => latest ? void resume(latest.id) : setLaunch({ mode: 'full' })}>{latest ? '继续学习' : '开始学习'}<ArrowRight size={15} /></button>
     </header>
     {leftOpen && <><div className="mobile-scrim" onClick={() => setLeftOpen(false)} /><aside className="left-sidebar">
-      <div className="sidebar-caption">学习空间</div><button className={'nav-item ' + (page === 'home' ? 'selected' : '')} onClick={home}><Grid2X2 size={19} />学习概览</button>
+      <div className="sidebar-caption">学习空间<button className="icon-button drawer-close" aria-label="关闭学习导航" onClick={() => setLeftOpen(false)}><X size={18} /></button></div><button className={'nav-item ' + (page === 'home' ? 'selected' : '')} onClick={home}><Grid2X2 size={19} />学习概览</button>
       <div className="sidebar-caption section-label">练习</div>
       <button className={'nav-item ' + (page === 'practice' && session?.mode === 'full' ? 'selected' : '')} onClick={() => latestFull ? void resume(latestFull.id) : setLaunch({ mode: 'full' })}><Layers3 size={19} />通刷模式<span className="nav-number">700</span></button>
       <button className={'nav-item ' + (session?.mode === 'paper80' && page === 'practice' ? 'selected' : '')} onClick={() => setLaunch({ mode: 'paper80' })}><ListChecks size={19} />80题随机卷<span className="nav-number">80</span></button>
       <button className={'nav-item ' + (session?.mode === 'paper20' && page === 'practice' ? 'selected' : '')} onClick={() => setLaunch({ mode: 'paper20' })}><Clock3 size={19} />20题小卷<span className="nav-number">20</span></button>
       <button className="nav-item" onClick={() => setLaunch({ mode: 'category' })}><BookOpen size={19} />分类练习</button>
-      <div className="sidebar-caption section-label">我的复习</div>
+      <button className="nav-item" onClick={() => { setPage('explore'); setAiOpen(false); if (window.innerWidth < 1024) setLeftOpen(false); }}><BookOpen size={19} />搜索与复习</button><div className="sidebar-caption section-label">我的复习</div>
       <button className="nav-item" onClick={() => setLaunch({ mode: 'review' })}><RotateCcw size={19} />错题与不确定<span className="nav-number">{d.stats.due}</span></button>
       <button className="nav-item" onClick={() => setLaunch({ mode: 'favorites' })}><Bookmark size={19} />我的收藏<span className="nav-number">{d.stats.favorites}</span></button>
       {question && session && <div className="question-map"><div className="sidebar-caption">当前题组 <span>{Object.keys(session.results).length}/{session.questions.length}</span></div><div className="map-grid">{session.questions.map((q, i) => <button key={q.id} aria-label={'跳到第' + (i + 1) + '题'} title={labels[q.type] + ' · ' + (session.results[q.id] ? session.results[q.id].correct ? '答对' : '答错' : session.drafts[q.id]?.length ? '已选择' : '未做')} className={'map-number ' + (session.results[q.id] ? session.results[q.id].correct ? 'right' : 'wrong' : session.drafts[q.id]?.length ? 'draft' : '') + (i === session.cursor ? ' current' : '')} disabled={busy} onClick={() => { void move(i); if (window.innerWidth < 1024) setLeftOpen(false); }}>{i + 1}{d.states[q.id]?.favorite && <i />}</button>)}</div><div className="map-legend"><span><i className="dot right" />答对</span><span><i className="dot wrong" />答错</span><span><i className="dot" />未做</span></div></div>}
@@ -151,10 +170,11 @@ export default function App() {
     </aside></>}
     <main className="main-content">
       {notice && <div className="notice" role="alert"><span>{notice}</span><div><button onClick={() => void retry()}>重试／加载最新</button><button className="icon-button" aria-label="关闭提示" onClick={() => setNotice('')}><X size={16} /></button></div></div>}
-      {page === 'home' && <Home d={d} latestFull={latestFull} onResume={resume} onLaunch={setLaunch} />}
+      {page === 'home' && <Home d={d} latestFull={latestFull} onResume={resume} onLaunch={setLaunch} onBackup={() => setPage('settings')} />}
       {page === 'practice' && session && question && <Practice key={session.id + question.id} s={session} q={question} state={d.states[question.id] ?? initialState(question.id)} theme={d.themes.find(t => t.id === question.theme)?.name ?? ''} prefs={d.prefs} busy={busy} paused={aiOpen || milestone} onMove={move} onAnswer={submit} onDraft={(qid, selected) => mutate('/progress', 'PATCH', { question_id: qid, selected }).then(() => undefined).catch(() => undefined)} onState={updateState} onAsk={() => { setAiOpen(true); if (window.innerWidth < 1024) setLeftOpen(false); }} onPrefs={updatePrefs} onFinish={() => setFinishConfirm(true)} onResult={() => { setPage('result'); setAiOpen(false); }} />}
       {page === 'result' && session && <Results s={session} onReview={() => setPage('practice')} onHome={home} onNew={() => setLaunch({ mode: session.mode })} onWrong={() => setLaunch({ mode: 'review' })} />}
-      {page === 'settings' && <Settings d={d} development={development} onPrefs={updatePrefs} onRestore={async (value) => { await api('/restore', 'POST', value); setSession(null); sessionRef.current = null; history.replaceState({}, '', '/'); await refresh(); setNotice('备份已恢复，当前数据已自动备份。'); }} onLogout={async () => { await api('/auth/logout', 'POST'); setAuth(false); }} />}
+      {page === 'explore' && <ReviewExplorer d={d} onStart={start} />}
+      {page === 'settings' && <AccountSettings d={d} user={user} onPrefs={updatePrefs} onRestore={async () => { setSession(null); sessionRef.current = null; history.replaceState({}, '', '/'); await refresh(); setNotice('本机记录已恢复，恢复前的快照可以回滚。'); }} onLogout={onLogout} onLock={onLock} />}
       <footer>中国近现代史纲要（2023版）<span>个人复习 · 700 道客观题</span></footer>
     </main>
     {aiOpen && question && session && <><div className="mobile-scrim ai-scrim" onClick={() => setAiOpen(false)} /><AIPanel q={question} s={session} configured={d.ai.configured} onClose={() => setAiOpen(false)} /></>}
@@ -164,17 +184,15 @@ export default function App() {
   </div>;
 }
 
-function Login({ onLogin }: { onLogin: () => void }) {
-  const [password, setPassword] = useState(''); const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
-  return <div className="login-page"><div className="login-card"><BookOpen className="blue" size={36} /><p className="eyebrow">你的个人复习空间</p><h1>史纲 Study</h1><p>从一道题，开始今天的复习。</p><form onSubmit={async e => { e.preventDefault(); setBusy(true); try { await api('/auth/login', 'POST', { password }); onLogin(); } catch (e) { setError(e instanceof Error ? e.message : '连接失败'); } finally { setBusy(false); } }}><label htmlFor="password">访问密码</label><input id="password" type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} required />{error && <p className="error" role="alert">{error}</p>}<button className="primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={18} /> : '进入复习空间'}<ArrowRight size={17} /></button></form><small>中国近现代史纲要（2023版） · 700 道题</small></div></div>;
-}
-
-function Home({ d, latestFull, onResume, onLaunch }: { d: Dashboard; latestFull?: Dashboard['sessions'][number]; onResume: (id: string) => Promise<void>; onLaunch: (value: Launch) => void }) {
+function Home({ d, latestFull, onResume, onLaunch, onBackup }: { d: Dashboard; latestFull?: Dashboard['sessions'][number]; onResume: (id: string) => Promise<void>; onLaunch: (value: Launch) => void; onBackup: () => void }) {
+  const [summary, setSummary] = useState({ lastBackup: 0, target: 20, today: 0 });
+  useEffect(() => { let live = true; void readData().then(data => { const today = new Date().toLocaleDateString('zh-CN'); const total = Object.values(data.sessions).flatMap(s => Object.values(s.results)).filter(r => new Date(r.answered_at * 1000).toLocaleDateString('zh-CN') === today).length; if (live) setSummary({ lastBackup: data.lastBackup, target: data.dailyTarget, today: total }); }).catch(() => undefined); return () => { live = false; }; }, [d.stats.answered]);
   const accuracy = d.stats.answered ? Math.round(d.stats.first_correct / d.stats.answered * 100) : null;
   const progress = latestFull?.answered ?? 0;
   return <div className="home-page">
     <section className="home-heading"><p className="eyebrow">中国近现代史纲要 · 2023版</p><h1>温故，知新。</h1><p className="lead">把每一道题，变成真正理解的知识。</p><span className="course-meta">700 道客观题<span />9 个历史主题<span />随时继续</span></section>
     <section className="stats-grid" aria-label="学习统计"><Stat value={String(d.stats.answered)} label="已练题目" suffix="/ 700" /><Stat value={accuracy === null ? '—' : String(accuracy)} label="首答正确率" suffix={accuracy === null ? '' : '%'} /><Stat value={String(d.stats.due)} label="待复习题目" /><Stat value={String(d.stats.mastered)} label="已确认掌握" /></section>
+    <div className="backup-reminder"><span>今日已练 {summary.today} 题 · 目标 {summary.target} 题。学习记录只保存在此浏览器。</span>{d.stats.answered > 0 && (!summary.lastBackup || Date.now() - summary.lastBackup > 7 * 86400000) && <button className="text-button" onClick={onBackup}>建议导出加密备份<ArrowRight size={15} /></button>}</div>
     <section className="mode-grid">
       <div className="full-card"><div className="full-card-text"><span className="capsule dark-capsule"><Layers3 size={14} />完整通刷</span><h2>一轮通刷。<br />串起历史的脉络。</h2><p>按历史主题走完 700 道题。每次一点，进度自动保存。</p><button className="primary" onClick={() => latestFull ? void onResume(latestFull.id) : onLaunch({ mode: 'full' })}>{latestFull ? '继续通刷' : '开始通刷'}<ArrowRight size={17} /></button></div><div className="full-ring"><svg viewBox="0 0 160 160" aria-hidden="true"><circle cx="80" cy="80" r="68" className="ring-track" /><circle cx="80" cy="80" r="68" className="ring-progress" strokeDasharray={427.26} strokeDashoffset={427.26 * (1 - progress / 700)} /></svg><div><strong>{progress}</strong><span>/ 700 题</span></div><p>{latestFull ? '本轮已完成' : '从第一题开始'}</p></div></div>
       <div className="small-modes"><button className="mode-card" onClick={() => onLaunch({ mode: 'paper80' })}><div className="mode-icon"><ListChecks size={23} /></div><div><h3>80 题随机卷</h3><p>35 单选 · 35 多选 · 10 判断</p><span>系统复习，检验整体掌握</span></div><ChevronRight size={21} /></button><button className="mode-card" onClick={() => onLaunch({ mode: 'paper20' })}><div className="mode-icon"><Clock3 size={23} /></div><div><h3>20 题小卷</h3><p>9 单选 · 9 多选 · 2 判断</p><span>碎片时间，轻量练一组</span></div><ChevronRight size={21} /></button></div>
@@ -193,12 +211,10 @@ function Practice({ s, q, state, theme, prefs, busy, paused, onMove, onAnswer, o
   onState: (qid: string, changes: Partial<QuestionState>) => Promise<void>; onAsk: () => void; onPrefs: (changes: Partial<Preferences>) => Promise<void>; onFinish: () => void; onResult: () => void;
 }) {
   const result = s.results[q.id]; const restricted = s.feedback === 'test' && s.status === 'active';
-  const [selected, setSelected] = useState<string[]>(() => {
-    try { const p = JSON.parse(localStorage.getItem(pendingKey(s.id, q.id)) ?? 'null') as Pending | null; if (p?.body.selected) return p.body.selected as string[]; } catch { /* Use server selection. */ }
-    return s.drafts[q.id] ?? [];
-  });
+  const [selected, setSelected] = useState<string[]>(s.drafts[q.id] ?? []);
   const [noteOpen, setNoteOpen] = useState(false);
-  const [note, setNote] = useState(() => localStorage.getItem('history-note-' + q.id) ?? state.note);
+  const [note, setNote] = useState(state.note);
+  useEffect(() => { let live = true; void getDrafts(s.id, q.id).then(d => { if (live) { if (d.pending?.body.selected && !s.results[q.id]) setSelected(d.pending.body.selected); if (d.note !== undefined) setNote(d.note); } }).catch(() => undefined); return () => { live = false; }; }, [s.id, q.id]);
   const [noteStatus, setNoteStatus] = useState('');
   const noteOriginal = useRef(state.note);
   const noteSaving = useRef(false);
@@ -215,8 +231,8 @@ function Practice({ s, q, state, theme, prefs, busy, paused, onMove, onAnswer, o
     if (note === noteOriginal.current || noteSaving.current) return;
     noteSaving.current = true;
     setNoteStatus('正在保存…');
-    try { await onState(q.id, { note }); localStorage.removeItem('history-note-' + q.id); noteOriginal.current = note; setNoteStatus('已保存'); }
-    catch { setNoteStatus('暂未保存，草稿已留在本机'); }
+    try { await onState(q.id, { note }); noteOriginal.current = note; setNoteStatus('已保存'); }
+    catch { setNoteStatus('保存失败，请保留当前页面并重试'); }
     finally { noteSaving.current = false; }
   };
   const choose = (id: string) => {
@@ -242,7 +258,7 @@ function Practice({ s, q, state, theme, prefs, busy, paused, onMove, onAnswer, o
       {busy && q.type !== 'multiple' && <p className="saving-label"><LoaderCircle className="spin" size={15} />正在保存…</p>}
       {result && <div className={'answer-result ' + (result.correct ? 'correct' : 'incorrect')}><div className="result-symbol">{result.correct ? <Check size={21} /> : <X size={21} />}</div><div><strong>{result.correct ? '答对了。' : '这道题，值得再看一次。'}</strong><p>你的答案：{answerLetters(result.selected)}<span>题库参考答案：{answerLetters(result.correct_ids)}</span></p><small>{result.correct ? '如果是猜对的，可以标记“不确定”，以后再练。' : '已加入错题列表，之后可以集中复习。'}</small></div><button className="text-button" onClick={onAsk}>看 AI 讲解<ChevronRight size={17} /></button></div>}
       <div className="question-tools"><button className={'text-button ' + (state.uncertain ? 'blue' : '')} onClick={() => void onState(q.id, { uncertain: !state.uncertain }).catch(() => undefined)}><CircleHelp size={17} />{state.uncertain ? '已标记不确定' : '答对但不确定'}</button>{!restricted && <button className={'text-button ' + (state.mastered ? 'blue' : '')} onClick={() => void onState(q.id, { mastered: !state.mastered }).catch(() => undefined)}><ShieldCheck size={17} />{state.mastered ? '已确认掌握' : '确认已掌握'}</button>}{!restricted && <button className="text-button" onClick={() => setNoteOpen(v => !v)}><BookOpen size={17} />{noteOpen ? '收起笔记' : state.note ? '查看笔记' : '写笔记'}</button>}{!restricted && <button className={'text-button ' + (state.disputed ? 'blue' : '')} onClick={() => void onState(q.id, { disputed: !state.disputed }).catch(() => undefined)}><Flag size={16} />{state.disputed ? '答案待核对' : '标记答案疑问'}</button>}</div>
-      {noteOpen && !restricted && <div className="note-panel"><label htmlFor="question-note">自己的记忆笔记</label><textarea id="question-note" rows={4} value={note} placeholder="写下这道题的考点、易混淆之处或自己的记忆方法…" onChange={e => { setNote(e.target.value); localStorage.setItem('history-note-' + q.id, e.target.value); setNoteStatus('草稿待保存'); }} onBlur={() => void saveNote()} /><div><small>{noteStatus || (state.note ? '已保存的笔记' : '笔记会随学习记录同步')}</small><button className="secondary compact" onClick={() => void saveNote()}>保存笔记</button></div></div>}
+      {noteOpen && !restricted && <div className="note-panel"><label htmlFor="question-note">自己的记忆笔记</label><textarea id="question-note" rows={4} value={note} placeholder="写下这道题的考点、易混淆之处或自己的记忆方法…" onChange={e => { setNote(e.target.value); setNoteStatus('正在保存草稿…'); void saveNoteDraft(q.id, e.target.value).then(() => setNoteStatus('草稿已加密保存在本机')).catch(e => setNoteStatus(e.message)); }} onBlur={() => void saveNote()} /><div><small>{noteStatus || (state.note ? '已保存的笔记' : '笔记加密保存在本机')}</small><button className="secondary compact" onClick={() => void saveNote()}>保存笔记</button></div></div>}
     </div>
     <div className="practice-controls"><button className="secondary" disabled={s.cursor === 0 || busy} onClick={() => void onMove(s.cursor - 1)}><ArrowLeft size={17} />上一题</button><label className="auto-next-control"><input type="checkbox" checked={prefs.auto_next} disabled={restricted} onChange={e => void onPrefs({ auto_next: e.target.checked })} /><span>{countdown ? '答对了，即将进入下一题…' : '答对后自动下一题'}</span></label>{s.cursor < s.questions.length - 1 ? <button className="primary" disabled={busy} onClick={() => void onMove(s.cursor + 1)}>下一题<ArrowRight size={17} /></button> : restricted ? <button className="primary" disabled={busy} onClick={onFinish}>提交整卷<Check size={17} /></button> : s.status === 'completed' ? <button className="primary" onClick={onResult}>查看结果<ArrowRight size={17} /></button> : <button className="primary" onClick={() => { const i = s.questions.findIndex(v => !s.results[v.id]); void onMove(i); }}>继续未做题<ArrowRight size={17} /></button>}</div>
     <div className="practice-footnote"><span>{completed} / {s.questions.length} 题{restricted ? '已选择' : '已完成'} · 进度自动保存</span>{restricted && <button className="text-button" onClick={onFinish}>提前交卷</button>}</div>
@@ -265,13 +281,13 @@ function LaunchDialog({ launch, d, busy, error, onClose, onStart }: { launch: La
   const [reduce, setReduce] = useState(d.prefs.reduce_repeats);
   const [filter, setFilter] = useState('all');
   const paper = launch.mode === 'paper80' || launch.mode === 'paper20';
-  const empty = launch.mode === 'review' && !d.stats.due || launch.mode === 'favorites' && !d.stats.favorites;
+  const empty = launch.mode === 'favorites' && !d.stats.favorites;
   return <Dialog onClose={onClose}><div className="dialog-symbol"><BookOpen size={25} /></div><p className="eyebrow">开始一次练习</p><h2>{launch.name ?? modeNames[launch.mode]}</h2><p>{launch.mode === 'paper80' ? '80 道题 · 35 单选 / 35 多选 / 10 判断' : launch.mode === 'paper20' ? '20 道题 · 9 单选 / 9 多选 / 2 判断' : launch.mode === 'full' ? '按历史主题通刷全部 700 道题，每 20 题小结。' : launch.mode === 'favorites' ? '回看你主动收藏的重点题。' : launch.mode === 'review' ? '把错题和不确定的知识，再练清楚。' : '按主题或题型进行专项练习。'}</p>
     {empty ? <div className="empty-state"><Bookmark size={26} /><p>{launch.mode === 'review' ? '目前没有待复习题目。练习中的错题和“不确定”标记会自动出现在这里。' : '还没有收藏题目。做题时点击书签，重点就会保存在这里。'}</p><button className="primary" onClick={onClose}>知道了</button></div> : <>
       {paper && <div className="segmented"><button className={feedback === 'immediate' ? 'selected' : ''} onClick={() => setFeedback('immediate')}>即时练习</button><button className={feedback === 'test' ? 'selected' : ''} onClick={() => setFeedback('test')}>整卷自测</button></div>}
       {paper && <p className="form-caption">{feedback === 'test' ? '交卷后统一看答案。交卷前，AI只给提示。' : '作答后立即显示红绿反馈，可以随时问AI。'}</p>}
       {launch.mode === 'category' && <div className="form-fields"><label>历史主题<select value={theme} onChange={e => setTheme(e.target.value)}><option value="">全部主题</option>{d.themes.map(t => <option key={t.id} value={t.id}>{t.name}（{t.total}题）</option>)}</select></label><label>题型<select value={type} onChange={e => setType(e.target.value as Kind | '')}><option value="">全部题型</option>{Object.entries(labels).map(([k, v]) => <option value={k} key={k}>{v}</option>)}</select></label><Toggle checked={randomOrder} onChange={setRandomOrder} title="随机题序" caption="关闭后按主题顺序练习" /></div>}
-      {launch.mode === 'review' && <label className="select-label">复习范围<select value={filter} onChange={e => setFilter(e.target.value)}><option value="all">错题与不确定题</option><option value="wrong">仅错题</option><option value="uncertain">仅不确定题</option></select></label>}
+      {launch.mode === 'review' && <label className="select-label">复习范围<select value={filter} onChange={e => setFilter(e.target.value)}><option value="all">错题与不确定题</option><option value="wrong">仅错题</option><option value="uncertain">仅不确定题</option><option value="recent">最近答错</option><option value="frequent">多次答错</option><option value="mastered">已掌握题</option></select></label>}
       <div className="launch-options"><Toggle title="打乱选项" caption="含有选项引用的题目保留原顺序" checked={shuffle} onChange={setShuffle} />{paper && <Toggle title="减少近期重复" caption="优先抽取近期没练过的题，题型配比保持不变" checked={reduce} onChange={setReduce} />}</div>
       {error && <p className="error" role="alert">{error}</p>}
       <div className="dialog-actions"><button className="secondary" onClick={onClose}>稍后再练</button><button className="primary" disabled={busy} onClick={() => void onStart({ mode: launch.mode, feedback, theme: theme || undefined, type: type || undefined, random_order: randomOrder, shuffle_options: shuffle, reduce_repeats: reduce, review_filter: filter })}>{busy ? <LoaderCircle className="spin" size={18} /> : '开始练习'}<ArrowRight size={17} /></button></div>
@@ -297,12 +313,4 @@ export function Dialog({ children, onClose }: { children: React.ReactNode; onClo
     else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
   }}><button className="icon-button dialog-close" aria-label="关闭对话框" onClick={onClose}><X size={20} /></button>{children}</div></div>;
 }
-function Toggle({ title, caption, checked, onChange }: { title: string; caption: string; checked: boolean; onChange: (value: boolean) => void }) { return <div className="toggle-row"><div><strong>{title}</strong><p>{caption}</p></div><button className={'switch ' + (checked ? 'on' : '')} role="switch" aria-label={title} aria-checked={checked} onClick={() => onChange(!checked)}><i /></button></div>; }
-
-function Settings({ d, development, onPrefs, onRestore, onLogout }: { d: Dashboard; development: boolean; onPrefs: (value: Partial<Preferences>) => Promise<void>; onRestore: (value: unknown) => Promise<void>; onLogout: () => Promise<void> }) {
-  const [backup, setBackup] = useState<{ value: unknown; name: string } | null>(null);
-  const [busy, setBusy] = useState(false); const [error, setError] = useState('');
-  return <div className="settings-page"><p className="eyebrow">学习空间</p><h1>按自己的节奏。</h1><p className="lead">调整练习偏好，保管你的学习记录。</p><section className="settings-card"><h2>练习偏好</h2><Toggle title="答对后自动下一题" caption="保存成功后等待1.5秒；答错或AI打开时停留" checked={d.prefs.auto_next} onChange={v => void onPrefs({ auto_next: v })} /><Toggle title="默认打乱选项" caption="新建练习时生效，含选项引用的题目保留原顺序" checked={d.prefs.shuffle_options} onChange={v => void onPrefs({ shuffle_options: v })} /><Toggle title="随机卷默认减少近期重复" caption="优先抽取未练或较久没练过的题" checked={d.prefs.reduce_repeats} onChange={v => void onPrefs({ reduce_repeats: v })} /></section><section className="settings-card"><div className="settings-title"><h2>AI 学习助手</h2><span className="capsule">{d.ai.configured ? '已连接' : '尚未连接'}</span></div><p>{d.ai.configured ? '当前模型：' + d.ai.model : '在服务器配置兼容接口地址、API Key和模型后，即可按题讲解与追问。基础练习功能随时可用。'}</p><p className="form-caption">密钥由服务器保管。生成的解析与对话保存到题目下，可随时回看。</p></section><section className="settings-card"><h2>学习记录与备份</h2><p>保存练习进度、历史作答、收藏、笔记与 AI 内容。</p><div className="data-buttons"><a className="primary" href="/api/export" download><Download size={18} />导出学习记录</a><label className="secondary"><Upload size={18} />从备份恢复<input type="file" accept=".json,application/json" hidden onChange={async e => { const file = e.target.files?.[0]; if (!file) return; try { if (file.size > 20 * 1024 * 1024) throw new Error('文件不能超过20MB。'); setBackup({ value: JSON.parse(await file.text()), name: file.name }); setError(''); } catch { setError('文件不是有效的学习记录备份，请选择导出的JSON文件。'); } e.target.value = ''; }} /></label></div><p className="form-caption">服务器每日北京时间03:00自动备份，保留最近7份；恢复前也会备份当前数据。</p>{error && <p className="error" role="alert">{error}</p>}</section>{!development && <button className="text-button" onClick={() => void onLogout()}>退出复习空间</button>}
-    {backup && <Dialog onClose={() => setBackup(null)}><h2>恢复这份学习记录？</h2><p>{backup.name}</p><p>恢复会替换现有学习记录，服务器会先保存当前数据的备份。</p>{error && <p className="error">{error}</p>}<div className="dialog-actions"><button className="secondary" onClick={() => setBackup(null)}>取消</button><button className="primary" disabled={busy} onClick={async () => { setBusy(true); try { await onRestore(backup.value); setBackup(null); } catch (e) { setError(e instanceof Error ? e.message : '恢复失败，原记录未修改。'); } finally { setBusy(false); } }}>{busy ? '正在恢复…' : '确认恢复'}</button></div></Dialog>}
-  </div>;
-}
+export function Toggle({ title, caption, checked, onChange }: { title: string; caption: string; checked: boolean; onChange: (value: boolean) => void }) { return <div className="toggle-row"><div><strong>{title}</strong><p>{caption}</p></div><button className={'switch ' + (checked ? 'on' : '')} role="switch" aria-label={title} aria-checked={checked} onClick={() => onChange(!checked)}><i /></button></div>; }
