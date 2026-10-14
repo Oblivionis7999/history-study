@@ -2,18 +2,23 @@
 
 本报告区分已执行验证与未测试环境。全部账号、密码和学习记录均为隔离合成数据；没有调用真实付费 AI，没有连接生产数据库或部署目标服务器。
 
+V2 实现提交 `18bcb5f9d6966544cb2768b9629524a43c2014cd` 的[完整 CI](https://github.com/Oblivionis7999/history-study/actions/runs/38598338639)全部通过。后续报告更新只记录结果，不改变该次已验证的应用实现。验证日期：2026-10-15（北京时间）。
+
 ## 当前结果
 
 | 检查 | 状态 | 证据 |
 |---|---|---|
 | V1 基线 | PASS | 16 项 Python、8 项 Chromium；原提交保留为 v1.0.0 |
-| V2 Python 与旧版回归 | PASS | Windows 本机 31 项通过 |
+| V2 Python 与旧版回归 | PASS | Windows 本机与 Linux CI 各 31 项通过 |
 | TypeScript / Vite / PWA 构建 | PASS | 生产资源生成成功 |
 | Chromium 页面 | PASS | Windows 本机 30 项通过，包含 10 个宽度与旋转 |
-| 生产构建 PWA | PASS | 1 项通过：静态缓存、无 API 缓存、断网继续做题、更新确认后保留记录 |
-| Linux 三浏览器 | PASS（上一版） | [首轮 CI](https://github.com/Oblivionis7999/history-study/actions/runs/38595236214) Chromium / Firefox / WebKit 各 29 项；新增管理员与长题场景等待本轮复测 |
-| Docker 生产配置集成 | FAIL（首轮，已修复待复测） | 首轮容器已构建、启动、HTTPS 登录和模拟 AI 通过，检查首页 CSP 时失败；已修复 Nginx 响应头继承 |
-| 本轮全量 CI 与隐私扫描 | 待复测 | 最终远端提交后更新此表 |
+| 生产构建 PWA | PASS | Windows 与 Linux CI 各 1 项：静态缓存、无 API 缓存、断网继续做题、更新确认后保留记录 |
+| Linux Chromium / Firefox / WebKit | PASS | 各 30 项，共 90 项，含管理员与最长题目响应式场景 |
+| Docker 生产配置集成 | PASS | config、build、启动健康、HTTPS/Secure Cookie、多账号权限、700 题、模拟 AI、安全响应头与 API 重启后持久化全部通过 |
+| 全量仓库隐私扫描 | PASS | 80 个跟踪文件无发现；发布前另检查 4 个提交中的 118 个不同文件版本，无发现 |
+| 中文文档与部署包 | PASS | 六份指定文档齐全、文档内相对链接有效；生成 ZIP 并检验完整性、700 题和敏感目录排除 |
+
+首轮 [CI](https://github.com/Oblivionis7999/history-study/actions/runs/38595236214) 曾在 Docker 的首页 CSP 检查失败：Nginx 子路径缓存头覆盖了父级安全头。当前已显式包含完整安全头配置，并复测首页、资源和 Service Worker 路径通过。该历史失败已解决，没有被跳过断言。
 
 ## 覆盖内容
 

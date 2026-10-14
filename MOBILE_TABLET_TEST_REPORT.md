@@ -27,7 +27,7 @@
 | 1280 | 1080 | 1280 × 820 | PASS |
 | 1440 | 1080 | 1440 × 820 | PASS |
 
-本机最新 30 项页面测试通过。Linux CI 分别执行 Chromium、Firefox、WebKit 同一测试集，最终次数和运行链接见 [测试总表](TEST_REPORT.md)。
+本机最新 30 项页面测试通过。[Linux CI](https://github.com/Oblivionis7999/history-study/actions/runs/38598338639) 的 Chromium、Firefox、WebKit 同一测试集各 30 项通过，共 90 项；以上宽度与旋转场景在三个引擎均通过。完整结果见 [测试总表](TEST_REPORT.md)。
 
 功能场景覆盖红绿判分、多选、自测、自动下一题、笔记收藏、加密文件下载/预览/恢复、管理员创建与禁用账号、邀请码注册、跨账号切换和延迟 AI 响应、刷新与浏览器进程重开。
 
