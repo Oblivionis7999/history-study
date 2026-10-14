@@ -11,7 +11,7 @@ ROOT=Path(__file__).resolve().parents[1]
 PRIVATE_DIRS={'.runtime','.venv','node_modules','dist','artifacts','__pycache__','.pytest_cache','test-results','playwright-report','blob-report','.codex','.idea','.vscode'}
 PRIVATE_SUFFIXES={'.pyc','.sqlite','.db','.log','.pem','.key','.p12','.pfx','.docx','.doc','.pdf','.zip','.7z','.rar','.tsbuildinfo'}
 RULES={
-    'machine_path':re.compile(r'(?i)\b[A-Z]:[\\/]|/(?:Users|home)/[^/\s]+'),
+    'machine_path':re.compile(r'(?i)\b[A-Z]:[\\/]|(?<![\w/])/(?:Users|home)/[^/\s]+'),
     'private_key':re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----'),
     'access_token':re.compile(r'(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-(?:proj-)?[A-Za-z0-9_-]{24,}|AKIA[A-Z0-9]{16})'),
     'email':re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'),
@@ -29,17 +29,20 @@ def inspect_blob(name,blob):
     path=Path(name)
     if set(path.parts)&PRIVATE_DIRS or path.suffix.lower() in PRIVATE_SUFFIXES or (path.name.startswith('.env') and name!='.env.example') or '-wal'==path.suffix or '-shm'==path.suffix:
         findings.append({'path':name,'kind':'private_file'})
-    if path.name.startswith(('id_rsa','id_ed25519','history-study-backup')):
+    if path.name.startswith(('id_rsa','id_ed25519','history-study-backup','study-recovery-key')):
         findings.append({'path':name,'kind':'private_file'})
     if blob.startswith(b'SQLite format 3'):
         findings.append({'path':name,'kind':'database_contents'})
+    # These three reviewed, generated app icons are the only binary source assets.
+    if name in {'public/icon-192.png','public/icon-512.png','public/apple-touch-icon.png'} and blob.startswith(b'\x89PNG\r\n\x1a\n'):
+        return findings
     try: text=blob.decode('utf-8-sig')
     except UnicodeDecodeError:
         return findings+[{'path':name,'kind':'unexpected_binary'}]
     if path.suffix=='.json':
         try:
             payload=json.loads(text)
-            if isinstance(payload,dict) and payload.get('format')=='history-study-v1':
+            if isinstance(payload,dict) and payload.get('format') in {'history-study-v1','history-study-encrypted-v2','history-study-migration-v2'}:
                 findings.append({'path':name,'kind':'study_backup'})
         except ValueError: pass
     generic_users={'root','admin','administrator','runner','node','study','user','system','postgres'}

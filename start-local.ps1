@@ -35,12 +35,12 @@ foreach ($taskPort in @(8765,5173)) {
 }
 New-Item -ItemType Directory -Path $taskRuntime -Force | Out-Null
 $taskPreviousDev = $env:DEV_MODE
-$taskPreviousDB = $env:DATABASE_PATH
+$taskPreviousDB = $env:AUTH_DATABASE_PATH
 $taskEntries = @()
 try {
     $env:DEV_MODE = '1'
-    $env:DATABASE_PATH = Join-Path $taskRuntime 'history.sqlite'
-    $taskAPI = Start-Process -FilePath $taskPython -ArgumentList @('-m','uvicorn','backend.app:app','--host','127.0.0.1','--port','8765') -WorkingDirectory $taskRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $taskRuntime 'local-api.log') -RedirectStandardError (Join-Path $taskRuntime 'local-api-error.log')
+    $env:AUTH_DATABASE_PATH = Join-Path $taskRuntime 'accounts.sqlite'
+    $taskAPI = Start-Process -FilePath $taskPython -ArgumentList @('-m','uvicorn','backend.app:app','--host','127.0.0.1','--port','8765','--no-proxy-headers') -WorkingDirectory $taskRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $taskRuntime 'local-api.log') -RedirectStandardError (Join-Path $taskRuntime 'local-api-error.log')
     $taskEntries += @{ id=$taskAPI.Id; started_ticks=$taskAPI.StartTime.ToUniversalTime().Ticks }
     $taskWeb = Start-Process -FilePath $taskNode -ArgumentList @('node_modules/vite/bin/vite.js','--host','127.0.0.1','--port','5173','--strictPort') -WorkingDirectory $taskRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $taskRuntime 'local-web.log') -RedirectStandardError (Join-Path $taskRuntime 'local-web-error.log')
     $taskEntries += @{ id=$taskWeb.Id; started_ticks=$taskWeb.StartTime.ToUniversalTime().Ticks }
@@ -52,5 +52,5 @@ try {
     throw
 } finally {
     $env:DEV_MODE = $taskPreviousDev
-    $env:DATABASE_PATH = $taskPreviousDB
+    $env:AUTH_DATABASE_PATH = $taskPreviousDB
 }

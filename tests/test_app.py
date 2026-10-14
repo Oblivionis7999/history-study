@@ -7,7 +7,7 @@ import pytest
 from argon2 import PasswordHasher
 from fastapi.testclient import TestClient
 
-from backend.app import BANK, QUESTIONS, Config, create_app
+from backend.legacy_app import BANK, QUESTIONS, Config, create_app
 from backend.storage import Store
 
 @pytest.fixture

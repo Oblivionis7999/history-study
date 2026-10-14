@@ -9,13 +9,15 @@ server {
     server_name study.example.com;
     ssl_certificate /etc/letsencrypt/live/study.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/study.example.com/privkey.pem;
-    client_max_body_size 20m;
+    client_max_body_size 256k;
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Host $http_host;
         proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # Only forward the TCP peer here. If Cloudflare is added, configure its
+        # official trusted ranges with real_ip first; do not trust arbitrary headers.
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_buffering off;
         proxy_read_timeout 180s;
     }
