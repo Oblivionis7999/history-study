@@ -5,7 +5,7 @@ import type { Dashboard, Feedback, Kind, Mode, Preferences, Question, QuestionSt
 import AIPanel from './AIPanel';
 import AccountSettings from './AccountSettings';
 import ReviewExplorer from './ReviewExplorer';
-import { activeEpoch, assertActive } from './vault';
+import { activeEpoch, assertActive, readData } from './vault';
 import { getDrafts, savePending, saveNoteDraft } from './learning';
 
 type Launch = { mode: Mode; theme?: string; name?: string };
@@ -170,7 +170,7 @@ export default function App({ user, onLogout, onLock }: { user: User; onLogout: 
     </aside></>}
     <main className="main-content">
       {notice && <div className="notice" role="alert"><span>{notice}</span><div><button onClick={() => void retry()}>重试／加载最新</button><button className="icon-button" aria-label="关闭提示" onClick={() => setNotice('')}><X size={16} /></button></div></div>}
-      {page === 'home' && <Home d={d} latestFull={latestFull} onResume={resume} onLaunch={setLaunch} />}
+      {page === 'home' && <Home d={d} latestFull={latestFull} onResume={resume} onLaunch={setLaunch} onBackup={() => setPage('settings')} />}
       {page === 'practice' && session && question && <Practice key={session.id + question.id} s={session} q={question} state={d.states[question.id] ?? initialState(question.id)} theme={d.themes.find(t => t.id === question.theme)?.name ?? ''} prefs={d.prefs} busy={busy} paused={aiOpen || milestone} onMove={move} onAnswer={submit} onDraft={(qid, selected) => mutate('/progress', 'PATCH', { question_id: qid, selected }).then(() => undefined).catch(() => undefined)} onState={updateState} onAsk={() => { setAiOpen(true); if (window.innerWidth < 1024) setLeftOpen(false); }} onPrefs={updatePrefs} onFinish={() => setFinishConfirm(true)} onResult={() => { setPage('result'); setAiOpen(false); }} />}
       {page === 'result' && session && <Results s={session} onReview={() => setPage('practice')} onHome={home} onNew={() => setLaunch({ mode: session.mode })} onWrong={() => setLaunch({ mode: 'review' })} />}
       {page === 'explore' && <ReviewExplorer d={d} onStart={start} />}
@@ -184,12 +184,15 @@ export default function App({ user, onLogout, onLock }: { user: User; onLogout: 
   </div>;
 }
 
-function Home({ d, latestFull, onResume, onLaunch }: { d: Dashboard; latestFull?: Dashboard['sessions'][number]; onResume: (id: string) => Promise<void>; onLaunch: (value: Launch) => void }) {
+function Home({ d, latestFull, onResume, onLaunch, onBackup }: { d: Dashboard; latestFull?: Dashboard['sessions'][number]; onResume: (id: string) => Promise<void>; onLaunch: (value: Launch) => void; onBackup: () => void }) {
+  const [summary, setSummary] = useState({ lastBackup: 0, target: 20, today: 0 });
+  useEffect(() => { let live = true; void readData().then(data => { const today = new Date().toLocaleDateString('zh-CN'); const total = Object.values(data.sessions).flatMap(s => Object.values(s.results)).filter(r => new Date(r.answered_at * 1000).toLocaleDateString('zh-CN') === today).length; if (live) setSummary({ lastBackup: data.lastBackup, target: data.dailyTarget, today: total }); }).catch(() => undefined); return () => { live = false; }; }, [d.stats.answered]);
   const accuracy = d.stats.answered ? Math.round(d.stats.first_correct / d.stats.answered * 100) : null;
   const progress = latestFull?.answered ?? 0;
   return <div className="home-page">
     <section className="home-heading"><p className="eyebrow">中国近现代史纲要 · 2023版</p><h1>温故，知新。</h1><p className="lead">把每一道题，变成真正理解的知识。</p><span className="course-meta">700 道客观题<span />9 个历史主题<span />随时继续</span></section>
     <section className="stats-grid" aria-label="学习统计"><Stat value={String(d.stats.answered)} label="已练题目" suffix="/ 700" /><Stat value={accuracy === null ? '—' : String(accuracy)} label="首答正确率" suffix={accuracy === null ? '' : '%'} /><Stat value={String(d.stats.due)} label="待复习题目" /><Stat value={String(d.stats.mastered)} label="已确认掌握" /></section>
+    <div className="backup-reminder"><span>今日已练 {summary.today} 题 · 目标 {summary.target} 题。学习记录只保存在此浏览器。</span>{d.stats.answered > 0 && (!summary.lastBackup || Date.now() - summary.lastBackup > 7 * 86400000) && <button className="text-button" onClick={onBackup}>建议导出加密备份<ArrowRight size={15} /></button>}</div>
     <section className="mode-grid">
       <div className="full-card"><div className="full-card-text"><span className="capsule dark-capsule"><Layers3 size={14} />完整通刷</span><h2>一轮通刷。<br />串起历史的脉络。</h2><p>按历史主题走完 700 道题。每次一点，进度自动保存。</p><button className="primary" onClick={() => latestFull ? void onResume(latestFull.id) : onLaunch({ mode: 'full' })}>{latestFull ? '继续通刷' : '开始通刷'}<ArrowRight size={17} /></button></div><div className="full-ring"><svg viewBox="0 0 160 160" aria-hidden="true"><circle cx="80" cy="80" r="68" className="ring-track" /><circle cx="80" cy="80" r="68" className="ring-progress" strokeDasharray={427.26} strokeDashoffset={427.26 * (1 - progress / 700)} /></svg><div><strong>{progress}</strong><span>/ 700 题</span></div><p>{latestFull ? '本轮已完成' : '从第一题开始'}</p></div></div>
       <div className="small-modes"><button className="mode-card" onClick={() => onLaunch({ mode: 'paper80' })}><div className="mode-icon"><ListChecks size={23} /></div><div><h3>80 题随机卷</h3><p>35 单选 · 35 多选 · 10 判断</p><span>系统复习，检验整体掌握</span></div><ChevronRight size={21} /></button><button className="mode-card" onClick={() => onLaunch({ mode: 'paper20' })}><div className="mode-icon"><Clock3 size={23} /></div><div><h3>20 题小卷</h3><p>9 单选 · 9 多选 · 2 判断</p><span>碎片时间，轻量练一组</span></div><ChevronRight size={21} /></button></div>
@@ -311,4 +314,3 @@ export function Dialog({ children, onClose }: { children: React.ReactNode; onClo
   }}><button className="icon-button dialog-close" aria-label="关闭对话框" onClick={onClose}><X size={20} /></button>{children}</div></div>;
 }
 export function Toggle({ title, caption, checked, onChange }: { title: string; caption: string; checked: boolean; onChange: (value: boolean) => void }) { return <div className="toggle-row"><div><strong>{title}</strong><p>{caption}</p></div><button className={'switch ' + (checked ? 'on' : '')} role="switch" aria-label={title} aria-checked={checked} onClick={() => onChange(!checked)}><i /></button></div>; }
-

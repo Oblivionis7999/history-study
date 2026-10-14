@@ -584,3 +584,6 @@ select { display: block; width: 100%; border: 1px solid #d5d5dc; border-radius: 
 
 .drawer-close { display: none; }
 @media(max-width:1023px) { .sidebar-caption:first-child { display:flex; justify-content:space-between; align-items:center; } .drawer-close { display: inline-flex; } }
+
+.ai-privacy > label:last-child { white-space: nowrap; }
+.ai-privacy > label:last-child select { width: auto; min-width: 0; flex: 1; }

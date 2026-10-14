@@ -2,6 +2,7 @@
 import datetime
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -44,7 +45,16 @@ def main():
             r = c.post('/api/ai/chat', json={'question_id':q['id'],'order':[o['id'] for o in q['options']], 'selected':[], 'action':'explain'})
             assert '"type": "done"' in r.text and 'Isolated CI explanation' in r.text; results['ai_mock'] = 'PASS'
             assert c.get('/api/export').status_code == 404
-            assert 'Content-Security-Policy' in c.get('/').headers
+            home = c.get('/'); assert home.status_code == 200
+            assets = re.findall(r'(?:src|href)="(/assets/[^\"]+)"', home.text)
+            assert assets
+            for static_path in ['/', '/sw.js', *assets]:
+                response = c.get(static_path)
+                assert response.status_code == 200
+                assert 'Content-Security-Policy' in response.headers
+                assert response.headers['X-Content-Type-Options'] == 'nosniff'
+            assert c.get('/sw.js').headers['Cache-Control'] == 'no-store'
+            results['security_headers_and_sw_cache_policy'] = 'PASS'
             run('restart', 'api')
             for attempt in range(30):
                 try:

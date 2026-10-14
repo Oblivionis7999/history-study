@@ -29,6 +29,11 @@ function grade(qid: string, selected: string[]): Result {
 }
 function record(data: LearningData, qid: string, result: Result) {
   const s = data.states[qid] ?? initialState(qid);
+  if (s.attempts === undefined) {
+    const previous = Object.values(data.sessions).map(session => session.results[qid]).filter(r => r && r !== result).sort((a, b) => a.answered_at - b.answered_at);
+    s.attempts = previous.length; s.wrong_count = previous.filter(r => !r.correct).length;
+    s.streak = 0; for (const r of previous) s.streak = r.correct ? s.streak + 1 : 0;
+  }
   s.first_correct ??= result.correct;
   s.last_answered = result.answered_at; s.attempts = (s.attempts ?? 0) + 1;
   s.streak = result.correct ? (s.streak ?? 0) + 1 : 0;
@@ -194,6 +199,14 @@ export function validateData(value: unknown): asserts value is LearningData {
   }
   for (const [qid, note] of Object.entries(value.noteDrafts)) if (!questions[qid] || typeof note !== 'string' || note.length > 12000) fail();
   for (const [id, entry] of Object.entries(value.cache)) if (!/^[a-f0-9]{64}$/.test(id) || !object(entry) || typeof entry.text !== 'string' || entry.text.length > 30000) fail();
+  const history: Record<string, Result[]> = {};
+  for (const session of Object.values(value.sessions) as StoredSession[]) for (const [qid, result] of Object.entries(session.results)) (history[qid] ??= []).push(result);
+  for (const [qid, results] of Object.entries(history)) {
+    const state = value.states[qid]; results.sort((a, b) => a.answered_at - b.answered_at);
+    // Two answers may share a millisecond; do not invent their ordering on import.
+    if (!state || !results.some(r => r.answered_at === results[0].answered_at && r.correct === state.first_correct) || (state.attempts !== undefined && state.attempts !== results.length) || (state.wrong_count !== undefined && state.wrong_count !== results.filter(r => !r.correct).length)) fail();
+  }
+  for (const [qid, state] of Object.entries(value.states) as [string, Params][]) if (!history[qid] && (state.first_correct !== undefined || state.attempts || state.wrong_count)) fail();
   // Pending writes are never replayed automatically; only valid session/selection drafts may be restored.
   for (const [id, pending] of Object.entries(value.pending) as [string, Params][]) {
     const [sid, qid] = id.split(':'); if (!value.sessions[sid] || !object(pending) || pending.sid !== sid || !object(pending.body) || !['/progress', '/answers', '/finish'].includes(pending.path)) fail();

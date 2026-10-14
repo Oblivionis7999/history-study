@@ -183,7 +183,7 @@ test('encrypted backup rejects tamper, wrong owner/version and supports rollback
     const original = await v.readData(), encrypted = await v.encryptBackup(original, phrase);
     const restored = await v.decryptBackup(encrypted, phrase); l.validateData(restored);
     const outcomes: string[] = [];
-    for (const mode of ['password', 'tamper', 'owner', 'version', 'grade']) {
+    for (const mode of ['password', 'tamper', 'owner', 'version', 'grade', 'statistics', 'missing-history']) {
       try {
         const candidate = structuredClone(restored);
         if (mode === 'password') await v.decryptBackup(encrypted, 'wrong-password-value');
@@ -191,6 +191,8 @@ test('encrypted backup rejects tamper, wrong owner/version and supports rollback
         if (mode === 'owner') { candidate.owner = 'different-user'; await l.restoreData(candidate); }
         if (mode === 'version') { candidate.bank_version = 'different-bank'; await l.restoreData(candidate); }
         if (mode === 'grade') { const s = Object.values(candidate.sessions)[0]; Object.values(s.results)[0].correct = !Object.values(s.results)[0].correct; await l.restoreData(candidate); }
+        if (mode === 'statistics') { Object.values(candidate.states)[0].attempts = 99; await l.restoreData(candidate); }
+        if (mode === 'missing-history') { candidate.sessions = {}; await l.restoreData(candidate); }
         outcomes.push('unexpected-pass');
       } catch { outcomes.push('rejected'); }
     }
@@ -200,7 +202,7 @@ test('encrypted backup rejects tamper, wrong owner/version and supports rollback
     await v.restorePrevious(); const rollback = await v.readData();
     return { outcomes, after: after.states[stateId].note, rollback: rollback.states[stateId].note, encrypted: JSON.stringify(encrypted) };
   }, { phrase: BACKUP });
-  expect(result.outcomes).toEqual(Array(5).fill('rejected')); expect(result.after).toBe(''); expect(result.rollback).toBe('恢复前保留'); expect(result.encrypted).not.toContain(qid);
+  expect(result.outcomes).toEqual(Array(7).fill('rejected')); expect(result.after).toBe(''); expect(result.rollback).toBe('恢复前保留'); expect(result.encrypted).not.toContain(qid);
 });
 
 test('offline answers and notes save without server persistence', async ({ page, context }) => {
@@ -310,6 +312,10 @@ test('encrypted V1 SQLite export restores historical answer and note in new acco
   await page.evaluate(async backup => { const data = await (await import('/src/vault.ts')).decryptBackup(backup, 'isolated-migration-password'); await (await import('/src/learning.ts')).restoreData(data); }, backup);
   const restored = await data(page); expect(restored.states[result.qid].note).toBe('V1 synthetic migration note'); expect(restored.states[result.qid].favorite).toBe(true); expect(restored.sessions[result.session].results[result.qid].correct).toBe(true);
   await page.reload(); await unlock(page); expect((await data(page)).states[result.qid].first_correct).toBe(true);
+  const next = await local(page, '/sessions', 'POST', { mode: 'category', question_id: result.qid });
+  await local(page, '/sessions/' + next.id + '/answers', 'POST', { revision: next.revision, question_id: result.qid, selected: questions[result.qid].answer_ids });
+  const again = await data(page); expect(again.states[result.qid].attempts).toBe(2);
+  await page.evaluate(async () => (await import('/src/learning.ts')).validateData(await (await import('/src/vault.ts')).readData()));
 });
 
 test('browser process close and reopen retains encrypted data but requires unlock', async ({ browser }) => {
@@ -346,10 +352,44 @@ test('backup UI exports encrypted file and previews before replacing', async ({ 
   expect(Object.keys((await data(page)).states)).toHaveLength(1);
 });
 
+test('administrator UI creates accounts and invitations while ordinary users cannot manage them', async ({ page }) => {
+  await page.getByRole('button', { name: '设置与数据', exact: true }).first().click();
+  await expect(page.getByRole('heading', { name: '管理员控制台' })).toHaveCount(0);
+  await logout(page); await login(page, 'e2e_admin');
+  await page.getByRole('button', { name: '设置与数据', exact: true }).first().click();
+  await page.getByText('创建账号', { exact: true }).click();
+  const name = 'ui' + randomUUID().slice(0, 12);
+  await page.getByLabel('新账号用户名', { exact: true }).fill(name);
+  await page.getByLabel('新账号显示名称', { exact: true }).fill('UI 测试账号');
+  await page.getByLabel('新账号登录密码', { exact: true }).fill(PASSWORD);
+  await page.getByRole('button', { name: '创建普通账号', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: '管理操作已保存。' })).toBeVisible();
+  await page.getByText('邀请码', { exact: true }).click();
+  await page.getByRole('button', { name: '生成邀请码', exact: true }).click();
+  const code = await page.locator('.admin-panel .recovery-box code').innerText();
+  await page.getByText(/^管理账号（/).click();
+  const row = page.locator('.admin-row').filter({ hasText: '@' + name });
+  await row.getByRole('button', { name: '禁用', exact: true }).click();
+  await expect(row.getByRole('button', { name: '启用', exact: true })).toBeEnabled();
+  await row.getByRole('button', { name: '启用', exact: true }).click();
+  await expect(row.getByRole('button', { name: '禁用', exact: true })).toBeEnabled();
+  await logout(page); await page.getByRole('button', { name: '使用邀请码注册', exact: true }).click();
+  const invited = 'iv' + randomUUID().slice(0, 12);
+  await page.getByLabel('用户名', { exact: true }).fill(invited);
+  await page.getByLabel('显示名称', { exact: true }).fill('受邀测试账号');
+  await page.getByLabel('邀请码', { exact: true }).fill(code);
+  await page.getByLabel('登录密码', { exact: true }).fill(PASSWORD);
+  await page.getByRole('button', { name: '创建账号', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('账号创建成功');
+  await login(page, invited);
+  expect((await data(page)).states).toEqual({});
+});
+
 for (const width of [320, 360, 375, 390, 414, 768, 820, 1024, 1280, 1440]) {
   test(`responsive ${width}px, portrait/landscape, drawers, long content and keyboard focus`, async ({ page }) => {
     await page.setViewportSize({ width, height: width < 768 ? 844 : 1080 });
-    await start(page, 'category', { type: 'multiple' });
+    const longest = [...bank.questions].sort((a: any, b: any) => (b.stem.length + b.options.reduce((n: number, o: any) => n + o.text.length, 0)) - (a.stem.length + a.options.reduce((n: number, o: any) => n + o.text.length, 0)))[0];
+    await start(page, 'category', { question_id: longest.id });
     const overflow = () => page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1);
     expect(await overflow()).toBe(false);
     await page.getByRole('button', { name: '问 AI', exact: true }).click();
